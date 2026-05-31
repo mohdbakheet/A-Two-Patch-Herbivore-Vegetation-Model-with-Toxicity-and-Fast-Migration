@@ -1,0 +1,597 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+# ============================================================
+# Two-patch herbivore-vegetation model:
+# full system (2), reduced system on M0 (11),
+# and reduced system on M_epsilon (19)
+#
+# Numerical exploration for different migration intensity alpha2
+# and toxicity beta = im/(4G)
+# ============================================================
+
+# Install if needed:
+# install.packages(c("deSolve", "ggplot2", "dplyr", "tidyr", "patchwork"))
+
+library(deSolve)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+# ============================================================
+# 1. Parameters from manuscript
+# ============================================================
+parms <- list(
+  K1 = 150,
+  K2 = 100,
+  r  = 0.2,
+  c0 = 0.175,   # original conversion constant before nondimensionalization
+  im = 0.75,
+  vu = 10,
+  b  = 20,
+
+  # User-editable because not fully visible in the manuscript snippet
+  mu1 = 0.06,   # dimensional herbivore mortality
+  G   = 1.50,   # toxicity tolerance parameter
+
+  # Migration settings
+  alpha1_dim = 0.15,   # dimensional alpha1
+  alpha2_dim = 0.25,   # dimensional alpha2
+  eps = 0.10           # small parameter
+)
+
+# ============================================================
+# 2. Convert to nondimensional parameters used in the model
+# ============================================================
+make_nd_parms <- function(parms, alpha2_dim = NULL, beta_override = NULL, eps_override = NULL) {
+  if (!is.null(alpha2_dim)) parms$alpha2_dim <- alpha2_dim
+  if (!is.null(eps_override)) parms$eps <- eps_override
+
+  b1   <- parms$b / parms$K1
+  b2   <- parms$b / parms$K2
+  eta  <- parms$im / parms$r
+  c    <- parms$c0 * parms$im / parms$r
+  a1   <- parms$alpha1_dim / parms$r
+  a2   <- parms$alpha2_dim / parms$r
+  k1   <- 1 / parms$K1
+  k2   <- 1 / parms$K2
+  mu   <- parms$mu1 / parms$r
+  beta <- if (is.null(beta_override)) parms$im / (4 * parms$G) else beta_override
+  rho1 <- parms$vu / parms$K1
+  rho2 <- parms$vu / parms$K2
+
+  list(
+    b1 = b1, b2 = b2, eta = eta, c = c,
+    alpha1 = a1, alpha2 = a2, k1 = k1, k2 = k2,
+    mu = mu, beta = beta, rho1 = rho1, rho2 = rho2,
+    eps = parms$eps
+  )
+}
+
+# ============================================================
+# 3. Helper functions
+# ============================================================
+Cfun <- function(v, b, rho, beta) {
+  1 - beta * (v - rho) / (b + v - rho)
+}
+
+m1_fun <- function(v1, p) p$alpha1 / (p$k1 + v1)
+m2_fun <- function(v2, p) p$alpha2 / (p$k2 + v2)
+
+hstar_M0 <- function(v1, v2, H, p) {
+  m1 <- m1_fun(v1, p)
+  m2 <- m2_fun(v2, p)
+  (m2 / (m1 + m2)) * H
+}
+
+psi_Meps <- function(v1, v2, H, p) {
+  m1 <- m1_fun(v1, p)
+  m2 <- m2_fun(v2, p)
+  H0 <- (m2 / (m1 + m2)) * H
+  corr <- 1 + (p$eps / (m1 + m2)) *
+    (p$c * Cfun(v1, p$b1, p$rho1, p$beta) * (v1 - p$rho1) / (p$b1 + v1 - p$rho1) - p$mu)
+  H0 * corr
+}
+
+# ============================================================
+# 4. Full model
+# state = c(v1, v2, h1, H)
+# ============================================================
+full_model <- function(t, state, p) {
+  v1 <- state["v1"]
+  v2 <- state["v2"]
+  h1 <- state["h1"]
+  H  <- state["H"]
+
+  C1 <- Cfun(v1, p$b1, p$rho1, p$beta)
+  C2 <- Cfun(v2, p$b2, p$rho2, p$beta)
+
+  dv1 <- v1 * (1 - v1) -
+    p$eta * (v1 - p$rho1) * h1 / (p$b1 + v1 - p$rho1) * C1
+
+  dv2 <- v2 * (1 - v2) -
+    p$eta * (v2 - p$rho2) * (H - h1) / (p$b2 + v2 - p$rho2) * C2
+
+  dh1 <- C1 * p$c * (v1 - p$rho1) * h1 / (p$b1 + v1 - p$rho1) -
+    p$mu * h1 +
+    (1 / p$eps) * (p$alpha2 * (H - h1) / (p$k2 + v2) - p$alpha1 * h1 / (p$k1 + v1))
+
+  dH <- C1 * p$c * (v1 - p$rho1) * h1 / (p$b1 + v1 - p$rho1) +
+    C2 * p$c * (v2 - p$rho2) * (H - h1) / (p$b2 + v2 - p$rho2) -
+    p$mu * H
+
+  list(c(dv1, dv2, dh1, dH))
+}
+
+# ============================================================
+# Fast subsystem eigenvalue heatmap
+# ============================================================
+
+p_fast <- make_nd_parms(
+  parms,
+  alpha2_dim = 0.25,
+  beta_override = 0.125
+)
+
+v1_grid <- seq(0.05, 1.20, length.out = 250)
+v2_grid <- seq(0.05, 1.20, length.out = 250)
+
+fast_df <- expand.grid(
+  v1 = v1_grid,
+  v2 = v2_grid
+) |>
+  dplyr::mutate(
+    m1 = p_fast$alpha1 / (p_fast$k1 + v1),
+    m2 = p_fast$alpha2 / (p_fast$k2 + v2),
+    lambda_fast = -(m1 + m2),
+    spectral_gap = -lambda_fast
+  )
+
+min_gap <- min(fast_df$spectral_gap, na.rm = TRUE)
+
+p_fast_eig <- ggplot(
+  fast_df,
+  aes(x = v2, y = v1, fill = lambda_fast)
+) +
+  geom_raster(interpolate = TRUE) +
+  coord_equal(expand = FALSE) +
+  scale_fill_viridis_c(
+    #name = expression(lambda[f])
+  ) +
+  annotate(
+    "label",
+    x = 1.03,
+    y = 0.16,
+    label = paste0(
+      "lambda[f] < 0 throughout\n",
+      "min(-lambda[f]) = ", round(min_gap, 2)
+    ),
+    parse = FALSE,
+    size = 4
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = expression(v[2]),
+    y = expression(v[1])
+  )
+
+print(p_fast_eig)
+
+ggsave(
+  "~/Downloads/Esraa Alam/scripts.R/results2/fast_eigenvalues_heatmap.pdf",
+  p_fast_eig,
+  width = 6.5,
+  height = 5.2
+)
+
+ggsave(
+  "~/Downloads/Esraa Alam/scripts.R/results2/fast_eigenvalues_heatmap.png",
+  p_fast_eig,
+  width = 6.5,
+  height = 5.2,
+  dpi = 300
+)
+# ============================================================
+# 5. Reduced model on M0
+# state = c(v1, v2, H)
+# ============================================================
+reduced_M0 <- function(t, state, p) {
+  v1 <- state["v1"]
+  v2 <- state["v2"]
+  H  <- state["H"]
+
+  h1s <- hstar_M0(v1, v2, H, p)
+  C1 <- Cfun(v1, p$b1, p$rho1, p$beta)
+  C2 <- Cfun(v2, p$b2, p$rho2, p$beta)
+
+  dv1 <- v1 * (1 - v1) -
+    p$eta * (v1 - p$rho1) * h1s / (p$b1 + v1 - p$rho1) * C1
+
+  dv2 <- v2 * (1 - v2) -
+    p$eta * (v2 - p$rho2) * (H - h1s) / (p$b2 + v2 - p$rho2) * C2
+
+  dH <- C1 * p$c * (v1 - p$rho1) * h1s / (p$b1 + v1 - p$rho1) +
+    C2 * p$c * (v2 - p$rho2) * (H - h1s) / (p$b2 + v2 - p$rho2) -
+    p$mu * H
+
+  list(c(dv1, dv2, dH))
+}
+
+# ============================================================
+# 6. Reduced model on M_epsilon
+# state = c(v1, v2, H)
+# ============================================================
+reduced_Meps <- function(t, state, p) {
+  v1 <- state["v1"]
+  v2 <- state["v2"]
+  H  <- state["H"]
+
+  psi <- psi_Meps(v1, v2, H, p)
+  C1  <- Cfun(v1, p$b1, p$rho1, p$beta)
+  C2  <- Cfun(v2, p$b2, p$rho2, p$beta)
+
+  dv1 <- v1 * (1 - v1) -
+    p$eta * (v1 - p$rho1) * psi / (p$b1 + v1 - p$rho1) * C1
+
+  dv2 <- v2 * (1 - v2) -
+    p$eta * (v2 - p$rho2) * (H - psi) / (p$b2 + v2 - p$rho2) * C2
+
+  dH <- C1 * p$c * (v1 - p$rho1) * psi / (p$b1 + v1 - p$rho1) +
+    C2 * p$c * (v2 - p$rho2) * (H - psi) / (p$b2 + v2 - p$rho2) -
+    p$mu * H
+
+  list(c(dv1, dv2, dH))
+}
+
+# ============================================================
+# 7. Simulation wrapper
+# ============================================================
+run_case <- function(alpha2_dim, beta_val, parms,
+                     times = seq(0, 80, by = 0.05),
+                     y0_full = c(v1 = 0.10, v2 = 0.10, h1 = 0.02, H = 0.02),
+                     atol = 1e-9, rtol = 1e-8) {
+
+  p <- make_nd_parms(parms, alpha2_dim = alpha2_dim, beta_override = beta_val)
+
+  # Full model
+  out_full <- as.data.frame(ode(
+    y = y0_full, times = times, func = full_model, parms = p,
+    method = "lsoda", atol = atol, rtol = rtol
+  ))
+
+  # Reduced M0 initial state: use unname() so column names remain exactly v1, v2, H
+  y0_M0 <- c(
+    v1 = unname(y0_full["v1"]),
+    v2 = unname(y0_full["v2"]),
+    H  = unname(y0_full["H"])
+  )
+
+  out_M0 <- as.data.frame(ode(
+    y = y0_M0, times = times, func = reduced_M0, parms = p,
+    method = "lsoda", atol = atol, rtol = rtol
+  ))
+
+  # Reduced Meps initial state
+  y0_Meps <- c(
+    v1 = unname(y0_full["v1"]),
+    v2 = unname(y0_full["v2"]),
+    H  = unname(y0_full["H"])
+  )
+
+  out_Meps <- as.data.frame(ode(
+    y = y0_Meps, times = times, func = reduced_Meps, parms = p,
+    method = "lsoda", atol = atol, rtol = rtol
+  ))
+
+  # Add metadata
+  out_full$model  <- "Full"
+  out_M0$model    <- "Reduced M0"
+  out_Meps$model  <- "Reduced Meps"
+
+  out_full$alpha2_dim <- alpha2_dim
+  out_M0$alpha2_dim   <- alpha2_dim
+  out_Meps$alpha2_dim <- alpha2_dim
+
+  out_full$beta <- beta_val
+  out_M0$beta   <- beta_val
+  out_Meps$beta <- beta_val
+
+  list(full = out_full, M0 = out_M0, Meps = out_Meps)
+}
+
+# ============================================================
+# 8. Explore migration intensity and toxicity
+# ============================================================
+alpha2_vals <- c(0.05, 0.15, 0.25, 0.50, 0.75)
+beta_vals   <- c(0.08, 0.16) #0.12, 0.16, 0.20)
+
+cases <- list()
+k <- 1
+for (a2 in alpha2_vals) {
+  for (bval in beta_vals) {
+    cases[[k]] <- run_case(alpha2_dim = a2, beta_val = bval, parms = parms)
+    k <- k + 1
+    k
+  }
+}
+
+all_full <- dplyr::bind_rows(lapply(cases, `[[`, "full"))
+all_M0   <- dplyr::bind_rows(lapply(cases, `[[`, "M0"))
+all_Meps <- dplyr::bind_rows(lapply(cases, `[[`, "Meps"))
+
+# ============================================================
+# 9. Check column names if needed
+# ============================================================
+cat("Columns in all_full:\n")
+print(colnames(all_full))
+
+cat("Columns in all_M0:\n")
+print(colnames(all_M0))
+
+cat("Columns in all_Meps:\n")
+print(colnames(all_Meps))
+
+# ============================================================
+# 10. Convert to long format for plotting
+# ============================================================
+full_long <- all_full |>
+  dplyr::select(time, v1, v2, H, alpha2_dim, beta, model) |>
+  tidyr::pivot_longer(cols = c(v1, v2, H), names_to = "state", values_to = "value")
+
+M0_long <- all_M0 |>
+  dplyr::select(time, v1, v2, H, alpha2_dim, beta, model) |>
+  tidyr::pivot_longer(cols = c(v1, v2, H), names_to = "state", values_to = "value")
+
+Meps_long <- all_Meps |>
+  dplyr::select(time, v1, v2, H, alpha2_dim, beta, model) |>
+  tidyr::pivot_longer(cols = c(v1, v2, H), names_to = "state", values_to = "value")
+
+all_long <- dplyr::bind_rows(full_long, M0_long, Meps_long)
+
+# ============================================================
+# 11. Publication-quality trajectory grid
+# ============================================================
+
+all_long$alpha_label <- paste0("alpha2 = ", all_long$alpha2_dim)
+all_long$beta_label  <- paste0("beta = ", all_long$beta)
+all_long$scenario <- paste0(
+  "α₂=", all_long$alpha2_dim,
+  "\nβ=", all_long$beta
+)
+
+p_traj <- ggplot(all_long,
+                 aes(x = time, y = value,
+                     color = model,
+                     linetype = model)) +
+
+  geom_line(linewidth = 0.8) +
+
+  facet_grid(
+    state ~ alpha_label + beta_label,
+    scales = "free_y"
+  ) +
+
+  scale_color_manual(values = c(
+    "Full" = "#E64B35",
+    "Reduced M0" = "#4DBBD5",
+    "Reduced Meps" = "#00A087"
+  )) +
+
+  theme_bw(base_size = 13) +
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),
+    legend.position = "bottom",
+    panel.spacing = unit(0.7, "lines")
+  ) +
+
+  labs(
+    #title = "Dynamics of the full and reduced models across migration and toxicity regimes",
+    x = "Time",
+    y = "State value"
+  )
+
+print(p_traj)
+
+# ============================================================
+# 12. Approximation error of reduced systems vs full model
+# ============================================================
+compare_error <- function(full_df, red_df) {
+  merged <- full_df |>
+    dplyr::select(time, v1_full = v1, v2_full = v2, H_full = H) |>
+    dplyr::inner_join(
+      red_df |> dplyr::select(time, v1_red = v1, v2_red = v2, H_red = H),
+      by = "time"
+    ) |>
+    dplyr::mutate(
+      err_v1 = abs(v1_full - v1_red),
+      err_v2 = abs(v2_full - v2_red),
+      err_H  = abs(H_full - H_red)
+    )
+
+  dplyr::summarise(
+    merged,
+    max_err_v1 = max(err_v1, na.rm = TRUE),
+    max_err_v2 = max(err_v2, na.rm = TRUE),
+    max_err_H  = max(err_H,  na.rm = TRUE),
+    rmse_v1    = sqrt(mean(err_v1^2, na.rm = TRUE)),
+    rmse_v2    = sqrt(mean(err_v2^2, na.rm = TRUE)),
+    rmse_H     = sqrt(mean(err_H^2,  na.rm = TRUE))
+  )
+}
+
+err_tbl <- dplyr::bind_rows(lapply(cases, function(z) {
+  e0 <- compare_error(z$full, z$M0)
+  ee <- compare_error(z$full, z$Meps)
+
+  dplyr::bind_rows(
+    dplyr::mutate(
+      e0,
+      alpha2_dim = unique(z$full$alpha2_dim),
+      beta = unique(z$full$beta),
+      model = "Reduced M0",
+      .before = 1
+    ),
+    dplyr::mutate(
+      ee,
+      alpha2_dim = unique(z$full$alpha2_dim),
+      beta = unique(z$full$beta),
+      model = "Reduced Meps",
+      .before = 1
+    )
+  )
+}))
+
+print(err_tbl)
+
+# ============================================================
+# 13. Example scenario
+# ============================================================
+
+example_case <- run_case(alpha2_dim = 0.25, beta_val = 0.125, parms = parms)
+
+ex_full <- example_case$full
+ex_M0   <- example_case$M0
+ex_Meps <- example_case$Meps
+
+ex_long <- dplyr::bind_rows(
+  ex_full |> dplyr::select(time, v1, v2, H, model),
+  ex_M0   |> dplyr::select(time, v1, v2, H, model),
+  ex_Meps |> dplyr::select(time, v1, v2, H, model)
+) |>
+  tidyr::pivot_longer(
+    cols = c(v1, v2, H),
+    names_to = "state",
+    values_to = "value"
+  )
+
+# ============================================================
+# Example trajectory plot
+# ============================================================
+
+p_example <- ggplot(
+  ex_long,
+  aes(time, value,
+      color = model,
+      linetype = model)
+) +
+
+  geom_line(linewidth = 1) +
+
+  facet_wrap(
+    ~state,
+    ncol = 1,
+    scales = "free_y"
+  ) +
+
+  scale_color_manual(values = c(
+    "Full" = "#E64B35",
+    "Reduced M0" = "#4DBBD5",
+    "Reduced Meps" = "#00A087"
+  )) +
+
+  theme_bw(base_size = 14) +
+
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.text  = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    legend.position = "bottom"
+  ) +
+
+  labs(
+    subtitle = expression(alpha[2] == 0.25 ~~ "," ~~ beta == 0.125),
+    x = "Time",
+    y = "State value"
+  )
+
+print(p_example)
+
+# ============================================================
+# 14. Optional heatmap of RMSE in H
+# ============================================================
+p_errH <- ggplot(err_tbl,
+                 aes(x = alpha2_dim,
+                     y = beta,
+                     fill = rmse_H)) +
+
+  geom_tile(color = "white") +
+
+  facet_wrap(~model) +
+
+  scale_fill_viridis_c(option = "H") +
+
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(face = "bold")
+  ) +
+
+  labs(
+    #title = "Approximation error of reduced systems",
+    x = expression(alpha[2]),
+    y = expression(beta),
+    fill = "RMSE(H)"
+  )
+
+print(p_errH)
+
+############################################
+#
+############################################
+p_example <- ggplot(ex_long,
+                    aes(time, value,
+                        color = model,
+                        linetype = model)) +
+
+  geom_line(linewidth = 1) +
+
+  facet_wrap(~state,
+             ncol = 1,
+             scales = "free_y") +
+
+  scale_color_manual(values = c(
+    "Full" = "#E64B35",
+    "Reduced M0" = "#4DBBD5",
+    "Reduced Meps" = "#00A087"
+  )) +
+
+  theme_bw(base_size = 14) +
+  theme(
+  strip.text = element_text(size = 11, face = "bold"),
+  axis.text  = element_text(size = 9),
+  axis.title = element_text(size = 11),
+  legend.text = element_text(size = 10)
+) +
+
+  labs(
+    #title = "Comparison of full and reduced model trajectories",
+    subtitle = expression(alpha[2] == 0.25 ~~ "," ~~ beta == 0.125),
+    x = "Time",
+    y = "State value"
+  )
+
+print(p_example)
+
+ggsave("~/Downloads/Esraa Alam/scripts.R/results2/figures/trajectory_comparison_grid.pdf", p_traj, width = 14, height = 10)
+ggsave("~/Downloads/Esraa Alam/scripts.R/results2/figures/example_trajectory.pdf", p_example, width = 7, height = 8)
+ggsave("~/Downloads/Esraa Alam/scripts.R/results2/figures/rmse_heatmap.pdf", p_errH, width = 7, height = 4)
+# ============================================================
+# 15. Save outputs if desired
+# ============================================================
+# ggsave("trajectories_grid.png", p_traj, width = 16, height = 10, dpi = 300)
+# ggsave("example_comparison.png", p_example, width = 8, height = 8, dpi = 300)
+# ggsave("rmse_heatmap_H.png", p_errH, width = 8, height = 4, dpi = 300)
+# write.csv(err_tbl, "reduction_error_summary.csv", row.names = FALSE)
+```
+
